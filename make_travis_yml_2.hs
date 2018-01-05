@@ -1099,13 +1099,13 @@ lowerboundsCmd  :: [String] -> IO a
 #ifndef LOWERBOUNDS_ENABLED
 lowerboundsCmd _ = dieCli [Error "Compiled without +lowerbounds"]
 #else
-lowerboundsCmd _ = do
+lowerboundsCmd argv = do
     let path = "cabal.project"
     Just proj <- runYamlWriter Nothing $ readProject path
     index <- loadIndex
 
     cols <- fmap M.unions $ forConcurrently ghcVersions $ \ghcVersion -> do
-        cells <- lowerBoundsForGhc index proj ghcVersion
+        cells <- lowerBoundsForGhc (null argv) index proj ghcVersion
         return $ M.mapKeysMonotonic ((,) ghcVersion) cells
 
     printTable cols
@@ -1216,11 +1216,12 @@ sortNub :: Ord a => [a] -> [a]
 sortNub = S.toList . S.fromList
 
 lowerBoundsForGhc
-    :: Index            -- Index
+    :: Bool             -- build
+    -> Index            -- Index
     -> Project Package  -- packages
     -> Version          -- GHC version
     -> IO (M.Map PackageName Cell)
-lowerBoundsForGhc index proj ghcVersion = do
+lowerBoundsForGhc build index proj ghcVersion = do
     let deps  = allBuildDepends ghcVersion proj
     let deps' = M.intersectionWith withinRange' index deps
 
@@ -1274,36 +1275,32 @@ lowerBoundsForGhc index proj ghcVersion = do
         | otherwise = CellHigh v u
 
     verify :: PackageName -> Maybe Version -> Version -> IO Cell
-    verify (display -> _pkgName) u v = do
-        return $ cellDone u v
+    verify (display -> pkgName) u v
+        | not build = return $ cellDone u v
+        | otherwise = do
+            thrPutStrLn $ colorCode ColorCyan ++ pfx pkgName v ++ "Trying to build" ++ colorReset
 
-{-
-
-        putStrLn $ "Trying to build " ++ display v
-        hFlush stdout
-
-        (ec, o', e') <- readProcessWithExitCode
-            "cabal"
-            [ "new-build"
-            , "-w", "ghc-" ++ display ghcVersion
-            , "--disable-tests", "--disable-benchmarks"
-            , "--constraint=" ++ pkgName ++ " ==" ++ display v
-            , "all"
-            ]
-            ""
-        o <- evaluate (force o')
-        e <- evaluate (force e')
-        case ec of
-            ExitSuccess   -> do
-                putStrLn $ display v ++ " is ok"
-                hFlush stdout
-                return $ Right v
-            ExitFailure _ -> do
-                putStrLn o
-                putStrLn e
-                hFlush stdout
-                return $ Left $ o ++ "\n" ++ e
--}
+            (ec, o', e') <- readProcessWithExitCode
+                "cabal"
+                [ "new-build"
+                , "-w", "ghc-" ++ display ghcVersion
+                , "--disable-tests", "--disable-benchmarks"
+                , "--constraint=" ++ pkgName ++ " ==" ++ display v
+                , "all"
+                ]
+                ""
+            o <- evaluate (force o')
+            e <- evaluate (force e')
+            case ec of
+                ExitSuccess   -> do
+                    thrPutStrLn $ colorCode ColorGreen ++ pfx pkgName v ++ "Build OK" ++ colorReset
+                    return $ cellDone u v
+                ExitFailure _ -> do
+                    thrPutStrLn $ colorCode ColorRed ++ pfx pkgName v ++ "Build failed" ++ colorReset
+                    thrPutStrLn o
+                    thrPutStrLn e
+                    thrPutStrLn $ colorCode ColorRed ++ pfx pkgName v ++ "Build failed" ++ colorReset
+                    return $ CellBuildError v o e
 
 allBuildDepends :: F.Foldable f => Version ->  f Package -> M.Map PackageName VersionRange
 allBuildDepends ghcVersion
