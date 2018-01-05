@@ -30,7 +30,7 @@ module MakeTravisYml (
     travisFromConfigFile, MakeTravisOutput, Options (..), defOptions, options,
     ) where
 
-import Control.Applicative ((<$>),(<|>), pure)
+import Control.Applicative ((<$>),(<|>))
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
 import Control.Monad (void, when, unless, filterM, liftM, liftM2, forM_, mzero, foldM)
@@ -84,6 +84,21 @@ import qualified ShellCheck.Formatter.Format as SC
 import qualified ShellCheck.Formatter.TTY as SC.TTY
 
 import Data.Functor.Identity (Identity (..))
+#endif
+
+#if LOWERBOUNDS_ENABLED
+import Control.Concurrent.Async (forConcurrently)
+import Control.Concurrent.QSem (QSem, newQSem, waitQSem, signalQSem)
+import Control.Exception (bracket)
+import Distribution.System (OS (Linux))
+import Distribution.Types.CondTree (simplifyCondTree)
+import System.Directory (getAppUserDataDirectory)
+import System.Process (readProcessWithExitCode)
+
+import qualified Data.ByteString.Lazy as LBS
+import qualified Codec.Archive.Tar as Tar
+import qualified Codec.Archive.Tar.Entry as Tar
+
 import System.IO.Unsafe (unsafePerformIO)
 #endif
 
@@ -251,7 +266,7 @@ foldedTellStrLns' label pfx prettyLabel labels output
 afterInfix :: Eq a => [a] -> [a] -> Maybe [a]
 afterInfix needle haystack = findMaybe (afterPrefix needle) (tails haystack)
 
--- | 
+-- |
 --
 -- >>> afterPrefix "FOO" "FOOBAR"
 -- Just "BAR"
@@ -261,7 +276,7 @@ afterPrefix needle haystack
     | needle `isPrefixOf` haystack = Just (drop (length needle) haystack)
     | otherwise                    = Nothing
 
--- | 
+-- |
 --
 -- >>> findMaybe readMaybe ["foo", "1", "bar"] :: Maybe Int
 -- Just 1
@@ -292,6 +307,7 @@ parseOpts argv = case argv of
         case findArgv ls of
             Nothing     -> dieCli [Error $ "expected REGENDATA line in " ++ fp ++ "\n"]
             Just argv'' -> parseOpts argv''
+    (cmd : argv') | cmd `isPrefixOf` "lowerbounds" -> lowerboundsCmd argv'
     _ -> parseOptsNoCommands argv
   where
     findArgv :: [String] -> Maybe [String]
@@ -328,6 +344,7 @@ dieCli errs = hPutStrLn stderr (usageMsg errs) >> exitFailure
         , ""
         , "Available commands:"
         , "    regenerate [TRAVIS.YAML]  Regenerate the file using the magic command in it. Default .travis.yml"
+        , "    lowerbounds               Find lowerbounds"
         , ""
         , "Available options:"
         ]
@@ -338,9 +355,9 @@ dieCli errs = hPutStrLn stderr (usageMsg errs) >> exitFailure
         , "    runghc make_travis_yml_2.hs -o .travis.yml someProject.cabal liblzma-dev"
         ]
 
-runYamlWriter :: Maybe FilePath -> YamlWriter IO () -> IO ()
+runYamlWriter :: Maybe FilePath -> YamlWriter IO a -> IO (Maybe a)
 runYamlWriter mfp m = do
-    result <- execWriterT (runMaybeT m)
+    (x, result) <- runWriterT (runMaybeT m)
     case result of
         Failure (formatDiagnostics -> errors) -> hPutStr stderr errors >> exitFailure
         Success (formatDiagnostics -> warnings) (unlines -> contents) -> do
@@ -349,6 +366,7 @@ runYamlWriter mfp m = do
             case mfp of
                 Nothing -> putStr contents'
                 Just fp -> writeFile fp contents'
+    return x
 
 ghcMajVer :: Version -> (Int,Int)
 ghcMajVer v
@@ -378,7 +396,7 @@ data Package = Pkg
 
 genTravisFromConfigFile :: ([String],Options) -> FilePath -> [String] -> IO ()
 genTravisFromConfigFile args@(_, opts) path xpkgs =
-    runYamlWriter (optOutput opts) $ travisFromConfigFile args path xpkgs
+    void $ runYamlWriter (optOutput opts) $ travisFromConfigFile args path xpkgs
 
 travisFromConfigFile
     :: MonadIO m
@@ -387,41 +405,64 @@ travisFromConfigFile
     -> [String]
     -> YamlWriter m ()
 travisFromConfigFile args@(_, opts) path xpkgs = do
-    cabalFiles <- getCabalFiles
-    pkgs <- T.mapM (configFromCabalFile opts) cabalFiles
     config' <- maybe (return emptyConfig) readConfigFile (optConfig opts)
-    (ghcs, prj) <- checkVersions pkgs
+    prj <- readProject path
+    ghcs <- checkVersions opts prj
     let config = optConfigMorphism opts config'
-    genTravisFromConfigs args xpkgs isCabalProject config prj ghcs
+    genTravisFromConfigs args xpkgs config prj ghcs
+
+checkVersions
+    :: MonadIO m
+    => Options
+    -> Project Package
+    -> YamlWriter m (Set Version)
+checkVersions _ prj | null (prjPackages prj) = putStrLnErr "Error reading cabal file(s)!"
+checkVersions _opts prj = do
+    putStrLnErrs $ F.foldMap checkVersion prj
+    return allVersions
   where
-    checkVersions
-        :: MonadIO m
-        => Project (Package, Set Version)
-        -> YamlWriter m (Set Version, Project Package)
-    checkVersions prj | null (prjPackages prj) = putStrLnErr "Error reading cabal file(s)!"
-    checkVersions prj = do
-        let (errors, names) = F.foldl' collectConfig mempty prj
-        putStrLnErrs errors
-        return (allVersions, prj { prjPackages = names })
+    allVersions = F.fold ghcs
+
+    ghcs = F.toList (fmap testedWithGhc prj)
+
+    testedWithGhc Pkg{pkgGpd} =
+        let compilers = testedWith $ packageDescription pkgGpd
+            ghcVerConstrs = [ vc | (GHC,vc) <- compilers ]
+            ghcVerConstrs' = simplifyVersionRange $ foldr unionVersionRanges noVersion ghcVerConstrs
+
+        in S.fromList $ filter (`withinRange` ghcVerConstrs') knownGhcVersions
+
+    checkVersion pkg
+        | S.null testedGhcVersions =
+            [ pkgName pkg
+              ++ "has no known GHC version is allowed by the 'tested-with' specification"
+            ]
+        | not (S.null diff) =
+            [ pkgName pkg
+              ++" is missing tested-with annotations for: "
+              ++ intercalate "," missingVersions
+            ]
+        | otherwise = []
       where
-        allVersions = F.foldMap snd prj
+        testedGhcVersions = testedWithGhc pkg
+        diff = allVersions `S.difference` testedGhcVersions
+        missingVersions = map dispGhcVersion $ S.toList diff
 
-        collectConfig
-            :: ([String], [Package])
-            -> (Package, Set Version)
-            -> ([String], [Package])
-        collectConfig aggregate (pkg, testWith) =
-            aggregate <> (errors, [pkg])
-          where
-            symDiff a b = S.union a b `S.difference` S.intersection a b
-            diff = symDiff testWith allVersions
-            missingVersions = map dispGhcVersion $ S.toList diff
-            errors | S.null diff = []
-                   | otherwise = pure $ mconcat
-                        [ pkgName pkg
-                        , " is missing tested-with annotations for: "
-                        ] ++ intercalate "," missingVersions
+{-
+    forM_ (optCollections opts) $ \c -> do
+        let v = collToGhcVer c
+        unless (v `elem` testedGhcVersions) $
+            putStrLnErr $ unlines
+               [ "collection " ++ c ++ " requires GHC " ++ dispGhcVersion v
+               , "add 'tested-width: GHC == " ++ dispGhcVersion v ++ "' to your .cabal file"
+               ]
+-}
 
+readProject :: MonadIO m =>  FilePath -> YamlWriter m (Project Package)
+readProject path = do
+    cabalFiles <- getCabalFiles
+    mapM configFromCabalFile cabalFiles
+  where
     isCabalProject :: Maybe FilePath
     isCabalProject
         | "cabal.project" `isPrefixOf` takeFileName path = Just path
@@ -470,9 +511,8 @@ travisFromConfigFile args@(_, opts) path xpkgs = do
             Nothing -> mb
             Just x  -> return (Just x)
 
-configFromCabalFile
-    :: MonadIO m => Options -> FilePath -> YamlWriter m (Package, Set Version)
-configFromCabalFile opts cabalFile = do
+configFromCabalFile :: MonadIO m => FilePath -> YamlWriter m Package
+configFromCabalFile cabalFile = do
     gpd <- liftIO $ readGenericPackageDescription maxBound cabalFile
 
     let compilers = testedWith $ packageDescription gpd
@@ -514,22 +554,7 @@ configFromCabalFile opts cabalFile = do
                      ++ intercalate ", " (map display unknownGhcVers) ++ "\n"
                      ++ "Known GHC versions: " ++ intercalate ", " (map display knownGhcVersions))
 
-    let testedGhcVersions = filter (`withinRange` ghcVerConstrs') knownGhcVersions
-
-    when (null testedGhcVersions) $ do
-        putStrLnErr "no known GHC version is allowed by the 'tested-with' specification"
-
-    forM_ (optCollections opts) $ \c -> do
-        let v = collToGhcVer c
-        unless (v `elem` testedGhcVersions) $
-            putStrLnErr $ unlines
-               [ "collection " ++ c ++ " requires GHC " ++ dispGhcVersion v
-               , "add 'tested-width: GHC == " ++ dispGhcVersion v ++ "' to your .cabal file"
-               ]
-
-    let pkg = Pkg pkgNameStr (takeDirectory cabalFile) gpd
-
-    return (pkg, S.fromList testedGhcVersions)
+    return $ Pkg pkgNameStr (takeDirectory cabalFile) gpd
   where
     lastStableGhcVers = nubBy ((==) `on` ghcMajVer) $ filter (not . isGhcHead) $ sortBy (flip compare) knownGhcVersions
 
@@ -543,12 +568,11 @@ genTravisFromConfigs
     :: Monad m
     => ([String], Options)
     -> [String]
-    -> Maybe FilePath
     -> Config
     -> Project Package
     -> Set Version
     -> YamlWriter m ()
-genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPackages = pkgs } versions = do
+genTravisFromConfigs (argv,opts) xpkgs config prj@Project { prjPackages = pkgs } versions = do
     let folds = cfgFolds config
 
     putStrLnInfo $
@@ -771,8 +795,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         [ sh $ "if [ $HCNUMVER -eq 80202 ]; then cabal new-install -w ${HC} --symlink-bindir=$HOME/.local/bin hlint" ++ hlintVersionConstraint ++ "; fi"
         ]
 
-    -- create cabal.project file
-    when (isNothing isCabalProject) $ generateCabalProject False
+    generateCabalProject False
 
     let pkgFilter = intercalate " | " $ map (wrap.pkgName) pkgs
         wrap s = "grep -Fv \"" ++ s ++ " ==\""
@@ -985,7 +1008,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
             | otherwise = quotedPaths $ \Pkg{pkgDir}  -> pkgDir
 
     projectFile :: FilePath
-    projectFile = fromMaybe "cabal.project" isCabalProject
+    projectFile = "cabal.project"
 
     quotedPaths :: (Package -> FilePath) -> String
     quotedPaths f = unwords $ map (f . quote) pkgs
@@ -1067,6 +1090,249 @@ collToGhcVer cid = case simpleParse cid of
     | isPrefixOf [6] v -> mkVersion [7,10,3]
     | isPrefixOf [7] v -> mkVersion [8,0,1]
     | otherwise -> error ("unknown collection " ++ show cid)
+
+-------------------------------------------------------------------------------
+-- Lowerbounds
+-------------------------------------------------------------------------------
+
+lowerboundsCmd  :: [String] -> IO a
+#ifndef LOWERBOUNDS_ENABLED
+lowerboundsCmd _ = dieCli [Error "Compiled without +lowerbounds"]
+#else
+lowerboundsCmd _ = do
+    let path = "cabal.project"
+    Just proj <- runYamlWriter Nothing $ readProject path
+    index <- loadIndex
+
+    cols <- fmap M.unions $ forConcurrently ghcVersions $ \ghcVersion -> do
+        cells <- lowerBoundsForGhc index proj ghcVersion
+        return $ M.mapKeysMonotonic ((,) ghcVersion) cells
+
+    printTable cols
+
+    -- TODO: exit code based on table result!
+    exitSuccess
+  where
+    ghcVersions =
+        [ mkVersion [7,4,2]
+        , mkVersion [7,6,3]
+        , mkVersion [7,8,4]
+        , mkVersion [7,10,3]
+        , mkVersion [8,0,2]
+        , mkVersion [8,2,2]
+        ]
+
+data Cell
+    = CellOk Version
+    | CellNoDep
+    | CellHigh Version Version
+    | CellNoVersion
+    | CellBuildError Version String String
+  deriving (Eq, Ord, Show)
+
+cellText :: Cell -> Txt
+cellText (CellOk v)             = Txt ColorGreen   (length s) s where s = display v
+cellText CellNoDep              = Txt ColorMagenta (length s) s where s = "no-dep"
+cellText CellNoVersion          = Txt ColorBlue    (length s) s where s = "no-ver"
+cellText (CellHigh v _)         = Txt ColorCyan    (length s) s where s = display v
+cellText (CellBuildError v _ _) = Txt ColorRed     (length s) s where s = display v
+
+data Color
+    = ColorNormal
+    | ColorGreen
+    | ColorRed
+    | ColorBlue
+    | ColorMagenta
+    | ColorCyan
+    | ColorYellow
+  deriving (Show)
+
+colorCode :: Color -> String
+colorCode ColorNormal  = ""
+colorCode ColorGreen   = "\x001b[32m"
+colorCode ColorRed     = "\x001b[31m"
+colorCode ColorBlue    = "\x001b[34m"
+colorCode ColorCyan    = "\x001b[36m"
+colorCode ColorMagenta = "\x001b[35m"
+colorCode ColorYellow  = "\x001b[33m"
+
+thrPutStrLnQSem :: QSem
+thrPutStrLnQSem = unsafePerformIO (newQSem 1)
+{-# NOINLINE thrPutStrLnQSem #-}
+
+thrPutStrLn :: String -> IO ()
+thrPutStrLn s = bracket (waitQSem thrPutStrLnQSem) (\_ -> signalQSem thrPutStrLnQSem) $ \() -> do
+    putStrLn s
+    hFlush stdout
+
+colorReset :: String
+colorReset = "\x001b[0m"
+
+data Txt = Txt !Color !Int String
+  deriving (Show)
+
+emptyTxt :: Txt
+emptyTxt = Txt ColorNormal 0 ""
+
+textLength :: Txt -> Int
+textLength (Txt _ n _) = n
+
+printTable :: M.Map (Version, PackageName) Cell -> IO ()
+printTable m = do
+    putStrLn header
+    forM_ packageNames $ \pn -> do
+        putStrLn $ packageRow pn
+  where
+    m' = fmap cellText m
+
+    ghcVersions  = sortNub $ [ v | (v, _) <- M.keys m ]
+    packageNames = sortNub $ [ n | (_, n) <- M.keys m ]
+
+    packageNamesW = maximum (0 : map (length . display) packageNames) + 2
+    ghcVersionsW =
+        [ maximum (6 : [ textLength rc | ((v', _), rc) <- M.toList m', v == v' ]) + 2
+        | v <- ghcVersions
+        ]
+
+    header :: String
+    header = leftPad "" packageNamesW ++
+        concat [ leftPad (display v) w | (v, w) <- zip ghcVersions ghcVersionsW ]
+
+    packageRow :: PackageName -> String
+    packageRow pn = leftPad (display pn) packageNamesW ++ concat
+        [ leftPadTxt (fromMaybe emptyTxt $ M.lookup (v, pn) m') w
+        | (v, w) <- zip ghcVersions ghcVersionsW
+        ]
+
+
+    leftPadTxt :: Txt -> Int -> String
+    leftPadTxt (Txt ColorNormal n' str) n = str ++ replicate (n - n') ' '
+    leftPadTxt (Txt c           n' str) n = colorCode c ++ str ++ colorReset ++ replicate (n - n') ' '
+
+leftPad :: String -> Int -> String
+leftPad str n = str ++ replicate (n - length str) ' '
+
+sortNub :: Ord a => [a] -> [a]
+sortNub = S.toList . S.fromList
+
+lowerBoundsForGhc
+    :: Index            -- Index
+    -> Project Package  -- packages
+    -> Version          -- GHC version
+    -> IO (M.Map PackageName Cell)
+lowerBoundsForGhc index proj ghcVersion = do
+    let deps  = allBuildDepends ghcVersion proj
+    let deps' = M.intersectionWith withinRange' index deps
+
+    fmap M.fromList $ T.for (M.toList deps') $ \(pkgName, vs) -> do
+        x <- findLowest pkgName Nothing vs
+        return (pkgName, x)
+  where
+    withinRange' vs vr = filter (`withinRange` vr) $ S.toList vs
+
+    pfx pkgName v = "GHC " ++ leftPad (display ghcVersion) 6  ++ " " ++ leftPad pkgName 20 ++ " " ++ leftPad v' 10 ++ " "
+      where
+        v' | v == version0 = ""
+           | otherwise = display v
+
+    version0 = mkVersion []
+
+    findLowest :: PackageName -> Maybe Version -> [Version] -> IO Cell
+    findLowest (display -> pkgName) _ [] = do
+        thrPutStrLn $ colorCode ColorBlue ++ pfx pkgName version0 ++ "No version found" ++ colorReset
+        return CellNoVersion
+    findLowest pn@(display -> pkgName) u (v : vs) = do
+        (ec, o, e) <- readProcessWithExitCode
+            "cabal"
+            [ "new-build"
+            , "--builddir=.dist-newstyle-" ++ display ghcVersion ++ "-" ++ pkgName ++ "-" ++ display v
+            , "-w", "ghc-" ++ display ghcVersion
+            , "--disable-tests", "--disable-benchmarks"
+            , "--constraint=" ++ pkgName ++ " ==" ++ display v
+            , "--dry-run"
+            , "all"
+            ]
+            ""
+        _ <- evaluate (force o)
+        _ <- evaluate (force e)
+
+        case ec of
+            ExitSuccess -> do
+                thrPutStrLn $ colorCode ColorGreen ++ pfx pkgName v ++ "Install plan found" ++ colorReset
+                hFlush stdout
+
+                verify pn u v
+
+            ExitFailure _ -> do
+                thrPutStrLn $ pfx pkgName v ++ "Install-plan not found, trying next version..."
+                hFlush stdout
+                findLowest pn (u <|> Just v) vs
+
+    cellDone Nothing v  = CellOk v
+    cellDone (Just u) v
+        | take 2 (versionNumbers u) == take 2 (versionNumbers v) = CellOk v
+        | otherwise = CellHigh v u
+
+    verify :: PackageName -> Maybe Version -> Version -> IO Cell
+    verify (display -> _pkgName) u v = do
+        return $ cellDone u v
+
+{-
+
+        putStrLn $ "Trying to build " ++ display v
+        hFlush stdout
+
+        (ec, o', e') <- readProcessWithExitCode
+            "cabal"
+            [ "new-build"
+            , "-w", "ghc-" ++ display ghcVersion
+            , "--disable-tests", "--disable-benchmarks"
+            , "--constraint=" ++ pkgName ++ " ==" ++ display v
+            , "all"
+            ]
+            ""
+        o <- evaluate (force o')
+        e <- evaluate (force e')
+        case ec of
+            ExitSuccess   -> do
+                putStrLn $ display v ++ " is ok"
+                hFlush stdout
+                return $ Right v
+            ExitFailure _ -> do
+                putStrLn o
+                putStrLn e
+                hFlush stdout
+                return $ Left $ o ++ "\n" ++ e
+-}
+
+allBuildDepends :: F.Foldable f => Version ->  f Package -> M.Map PackageName VersionRange
+allBuildDepends ghcVersion
+    = M.map simplifyVersionRange
+    . M.unionsWith intersectVersionRanges
+    . map extractBuildDepends
+    . F.toList
+  where
+    extractBuildDepends :: Package -> M.Map PackageName VersionRange
+    extractBuildDepends Pkg{pkgGpd} =
+        maybe M.empty libBD (condLibrary pkgGpd)
+
+    libBD :: PD.CondTree PD.ConfVar [Dependency] PD.Library
+          -> M.Map PackageName VersionRange
+    libBD
+        = M.fromListWith intersectVersionRanges
+        . map dependencyToPair
+        . fst
+        . simplifyCondTree (Right . evalConfVar)
+
+    dependencyToPair (Dependency p vr) = (p, vr)
+
+    evalConfVar :: PD.ConfVar -> Bool
+    evalConfVar (PD.OS Linux)    = True
+    evalConfVar (PD.Impl GHC vr) = ghcVersion `withinRange` vr
+    evalConfVar _                = False
+
+
+#endif
 
 -------------------------------------------------------------------------------
 -- Jobs
@@ -1535,6 +1801,37 @@ ghcVersionPredicate = conj . asVersionIntervals
         [x]       -> show (x * 10000)
         [x,y]     -> show (x * 10000 + y * 100)
         (x:y:z:_) -> show (x * 10000 + y * 100 + z)
+
+-------------------------------------------------------------------------------
+-- Index utils
+-------------------------------------------------------------------------------
+
+#ifdef LOWERBOUNDS_ENABLED
+
+type Index = M.Map PackageName (Set Version)
+
+loadIndex :: IO Index
+loadIndex = do
+    c <- getAppUserDataDirectory "cabal"
+    -- TODO: we could read ~/.cabal/config
+    let indexTar = c </> "packages/hackage.haskell.org/01-index.tar"
+    contents <- LBS.readFile indexTar
+    return $ foldl' add M.empty $ entriesToList $ Tar.read contents
+  where
+    entriesToList :: Tar.Entries Tar.FormatError -> [Tar.Entry]
+    entriesToList Tar.Done        = []
+    entriesToList (Tar.Fail s)    = error (show s)
+    entriesToList (Tar.Next e es) = e : entriesToList es
+
+    add m entry = case split $ Tar.fromTarPathToPosixPath (Tar.entryTarPath entry) of
+        [pkgName, versionStr, _] | Just v <- simpleParse versionStr ->
+            M.insertWith S.union (mkPackageName pkgName) (S.singleton v) m
+        _ -> m
+
+    split :: FilePath -> [FilePath]
+    split = fromMaybe [] . maybeReadP (sepBy (munch1 (/= '/')) (char '/'))
+
+#endif
 
 -------------------------------------------------------------------------------
 -- From Cabal
