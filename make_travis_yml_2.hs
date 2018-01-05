@@ -87,6 +87,7 @@ import Data.Functor.Identity (Identity (..))
 #endif
 
 #if LOWERBOUNDS_ENABLED
+import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.Async (forConcurrently)
 import Control.Concurrent.QSem (QSem, newQSem, waitQSem, signalQSem)
 import Control.Exception (bracket)
@@ -1215,6 +1216,12 @@ leftPad str n = str ++ replicate (n - length str) ' '
 sortNub :: Ord a => [a] -> [a]
 sortNub = S.toList . S.fromList
 
+cabalQSem :: QSem
+cabalQSem = unsafePerformIO $ do
+    n <- getNumCapabilities
+    newQSem n
+{-# NOINLINE cabalQSem #-}
+
 lowerBoundsForGhc
     :: Bool             -- build
     -> Index            -- Index
@@ -1225,8 +1232,11 @@ lowerBoundsForGhc build index proj ghcVersion = do
     let deps  = allBuildDepends ghcVersion proj
     let deps' = M.intersectionWith withinRange' index deps
 
-    fmap M.fromList $ T.for (M.toList deps') $ \(pkgName, vs) -> do
-        x <- findLowest pkgName Nothing vs
+    -- non-dry sem
+    qsem <- newQSem 1
+
+    fmap M.fromList $ forConcurrently (M.toList deps') $ \(pkgName, vs) -> do
+        x <- findLowest qsem pkgName Nothing vs
         return (pkgName, x)
   where
     withinRange' vs vr = filter (`withinRange` vr) $ S.toList vs
@@ -1238,12 +1248,12 @@ lowerBoundsForGhc build index proj ghcVersion = do
 
     version0 = mkVersion []
 
-    findLowest :: PackageName -> Maybe Version -> [Version] -> IO Cell
-    findLowest (display -> pkgName) _ [] = do
+    findLowest :: QSem -> PackageName -> Maybe Version -> [Version] -> IO Cell
+    findLowest _ (display -> pkgName) _ [] = do
         thrPutStrLn $ colorCode ColorBlue ++ pfx pkgName version0 ++ "No version found" ++ colorReset
         return CellNoVersion
-    findLowest pn@(display -> pkgName) u (v : vs) = do
-        (ec, o, e) <- readProcessWithExitCode
+    findLowest qsem pn@(display -> pkgName) u (v : vs) = do
+        (ec, o, e) <- bracket (waitQSem cabalQSem) (\_ -> signalQSem cabalQSem) $ \() -> readProcessWithExitCode
             "cabal"
             [ "new-build"
             , "--builddir=.dist-newstyle-" ++ display ghcVersion ++ "-" ++ pkgName ++ "-" ++ display v
@@ -1262,22 +1272,22 @@ lowerBoundsForGhc build index proj ghcVersion = do
                 thrPutStrLn $ colorCode ColorGreen ++ pfx pkgName v ++ "Install plan found" ++ colorReset
                 hFlush stdout
 
-                verify pn u v
+                verify qsem pn u v
 
             ExitFailure _ -> do
                 thrPutStrLn $ pfx pkgName v ++ "Install-plan not found, trying next version..."
                 hFlush stdout
-                findLowest pn (u <|> Just v) vs
+                findLowest qsem pn (u <|> Just v) vs
 
     cellDone Nothing v  = CellOk v
     cellDone (Just u) v
         | take 2 (versionNumbers u) == take 2 (versionNumbers v) = CellOk v
         | otherwise = CellHigh v u
 
-    verify :: PackageName -> Maybe Version -> Version -> IO Cell
-    verify (display -> pkgName) u v
+    verify :: QSem -> PackageName -> Maybe Version -> Version -> IO Cell
+    verify qsem (display -> pkgName) u v
         | not build = return $ cellDone u v
-        | otherwise = do
+        | otherwise = bracket (waitQSem qsem) (\_ -> signalQSem qsem) $ \() -> do
             thrPutStrLn $ colorCode ColorCyan ++ pfx pkgName v ++ "Trying to build" ++ colorReset
 
             (ec, o', e') <- readProcessWithExitCode
