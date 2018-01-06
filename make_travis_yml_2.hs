@@ -1115,7 +1115,9 @@ lowerboundsCmd argv = do
     exitSuccess
   where
     ghcVersions =
-        [ mkVersion [7,4,2]
+        [ mkVersion [7,0,4]
+        , mkVersion [7,2,2]
+        , mkVersion [7,4,2]
         , mkVersion [7,6,3]
         , mkVersion [7,8,4]
         , mkVersion [7,10,3]
@@ -1269,7 +1271,7 @@ lowerBoundsForGhc build index proj ghcVersion = do
 
         case ec of
             ExitSuccess -> do
-                thrPutStrLn $ colorCode ColorGreen ++ pfx pkgName v ++ "Install plan found" ++ colorReset
+                thrPutStrLn $ colorCode ColorMagenta ++ pfx pkgName v ++ "Install plan found" ++ colorReset
                 hFlush stdout
 
                 verify qsem pn u v
@@ -1335,8 +1337,10 @@ allBuildDepends ghcVersion
 
     evalConfVar :: PD.ConfVar -> Bool
     evalConfVar (PD.OS Linux)    = True
+    evalConfVar (PD.OS _)        = False
     evalConfVar (PD.Impl GHC vr) = ghcVersion `withinRange` vr
-    evalConfVar _                = False
+    evalConfVar (PD.Impl _ _)    = False
+    evalConfVar _                = True
 
 
 #endif
