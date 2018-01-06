@@ -1262,6 +1262,7 @@ lowerBoundsForGhc build index proj ghcVersion = do
             , "-w", "ghc-" ++ display ghcVersion
             , "--disable-tests", "--disable-benchmarks"
             , "--constraint=" ++ pkgName ++ " ==" ++ display v
+            , "--ghc-options=" ++ ghcOptions
             , "--dry-run"
             , "all"
             ]
@@ -1298,6 +1299,7 @@ lowerBoundsForGhc build index proj ghcVersion = do
                 , "-w", "ghc-" ++ display ghcVersion
                 , "--disable-tests", "--disable-benchmarks"
                 , "--constraint=" ++ pkgName ++ " ==" ++ display v
+                , "--ghc-options=" ++ ghcOptions
                 , "all"
                 ]
                 ""
@@ -1313,6 +1315,10 @@ lowerBoundsForGhc build index proj ghcVersion = do
                     thrPutStrLn e
                     thrPutStrLn $ colorCode ColorRed ++ pfx pkgName v ++ "Build failed" ++ colorReset
                     return $ CellBuildError v o e
+
+    ghcOptions
+        | ghcVersion >= mkVersion [7,8] = "-j4 +RTS -A64m -I0 -qg -RTS"
+        | otherwise                     = "    +RTS -A64m -I0 -qg -RTS"
 
 allBuildDepends :: F.Foldable f => Version ->  f Package -> M.Map PackageName VersionRange
 allBuildDepends ghcVersion
